@@ -1,0 +1,132 @@
+name: Build WSL2 bzImage
+
+on:
+  workflow_dispatch:
+    inputs:
+      linux_tarball_url:
+        description: Linux source tarball URL compatible with this port
+        required: true
+        type: string
+        default: https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.10.tar.xz
+      wsl_kernel_zip_url:
+        description: Microsoft WSL kernel source ZIP compatible with this port
+        required: true
+        type: string
+        default: https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/linux-msft-wsl-6.18.54.1.zip
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build x86_64 WSL2 kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out adaptation project
+        uses: actions/checkout@v4
+
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            bc bison build-essential cpio curl dwarves flex git m4 patch \
+            libelf-dev libncurses-dev libssl-dev python3 rsync \
+            unzip xz-utils
+
+      - name: Download and extract Linux and Microsoft WSL sources
+        env:
+          LINUX_TARBALL_URL: ${{ inputs.linux_tarball_url }}
+          WSL_KERNEL_ZIP_URL: ${{ inputs.wsl_kernel_zip_url }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/downloads" "$RUNNER_TEMP/linux" "$RUNNER_TEMP/wsl-reference"
+          curl --fail --location --retry 3 --retry-all-errors \
+            "$LINUX_TARBALL_URL" \
+            --output "$RUNNER_TEMP/downloads/linux.tarball"
+          curl --fail --location --retry 3 --retry-all-errors \
+            "$WSL_KERNEL_ZIP_URL" \
+            --output "$RUNNER_TEMP/downloads/wsl-kernel.zip"
+
+          tar -xf "$RUNNER_TEMP/downloads/linux.tarball" \
+            --strip-components=1 -C "$RUNNER_TEMP/linux"
+          if ! grep -q '^VERSION = 7$' "$RUNNER_TEMP/linux/Makefile" \
+            || ! grep -q '^PATCHLEVEL = 2$' "$RUNNER_TEMP/linux/Makefile" \
+            || ! grep -q '^SUBLEVEL = 10$' "$RUNNER_TEMP/linux/Makefile"; then
+            echo "The Linux tarball must contain kernel 7.2.10" >&2
+            exit 1
+          fi
+          unzip -q "$RUNNER_TEMP/downloads/wsl-kernel.zip" \
+            -d "$RUNNER_TEMP/wsl-reference"
+
+      - name: Apply Linux 7.2.10 WSL adaptation patches
+        env:
+          LINUX_SRC: ${{ runner.temp }}/linux
+          WSL_REFERENCE: ${{ runner.temp }}/wsl-reference
+        run: |
+          set -euo pipefail
+          cp -a Microsoft "$LINUX_SRC/"
+          cp -a patches "$LINUX_SRC/"
+
+          cd "$LINUX_SRC"
+          for patch_file in patches/*.patch; do
+            patch --batch --forward -p1 < "$patch_file"
+          done
+
+          DXG_SOURCE=$(find "$WSL_REFERENCE" -type d \
+            -path '*/drivers/hv/dxgkrnl' -print -quit)
+          if [ -z "$DXG_SOURCE" ]; then
+            echo "Could not find drivers/hv/dxgkrnl in the Microsoft WSL source ZIP" >&2
+            exit 1
+          fi
+
+          WSL_SOURCE_ROOT=${DXG_SOURCE%/drivers/hv/dxgkrnl}
+          DXG_UAPI="$WSL_SOURCE_ROOT/include/uapi/misc/d3dkmthk.h"
+          if [ ! -f "$DXG_UAPI" ]; then
+            echo "Could not find the DXGKRNL UAPI header in the Microsoft WSL source ZIP" >&2
+            exit 1
+          fi
+
+          mkdir -p drivers/hv/dxgkrnl include/uapi/misc
+          cp -a "$DXG_SOURCE/." drivers/hv/dxgkrnl/
+          cp "$DXG_UAPI" include/uapi/misc/d3dkmthk.h
+
+      - name: Configure and build bzImage
+        env:
+          LINUX_SRC: ${{ runner.temp }}/linux
+          BUILD_OUT: ${{ runner.temp }}/out-x86
+          LINUX_TARBALL_URL: ${{ inputs.linux_tarball_url }}
+          WSL_KERNEL_ZIP_URL: ${{ inputs.wsl_kernel_zip_url }}
+        run: |
+          set -euo pipefail
+          make -C "$LINUX_SRC" O="$BUILD_OUT" \
+            KCONFIG_CONFIG="$LINUX_SRC/Microsoft/config-wsl" olddefconfig
+
+          grep -q '^CONFIG_DXGKRNL=y$' "$LINUX_SRC/Microsoft/config-wsl"
+
+          make -C "$LINUX_SRC" O="$BUILD_OUT" \
+            KCONFIG_CONFIG="$LINUX_SRC/Microsoft/config-wsl" \
+            -j"$(nproc)" bzImage
+
+          mkdir -p "$RUNNER_TEMP/release"
+          cp "$BUILD_OUT/arch/x86/boot/bzImage" \
+            "$RUNNER_TEMP/release/bzImage-7.2.10-wsl2-x86_64"
+          make -s -C "$LINUX_SRC" O="$BUILD_OUT" \
+            KCONFIG_CONFIG="$LINUX_SRC/Microsoft/config-wsl" kernelrelease \
+            > "$RUNNER_TEMP/release/kernelrelease.txt"
+          sha256sum "$RUNNER_TEMP/release/bzImage-7.2.10-wsl2-x86_64" \
+            > "$RUNNER_TEMP/release/SHA256SUMS"
+          printf 'Linux source: %s\nMicrosoft WSL source: %s\n' \
+            "$LINUX_TARBALL_URL" \
+            "$WSL_KERNEL_ZIP_URL" \
+            > "$RUNNER_TEMP/release/build-sources.txt"
+
+      - name: Upload bzImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bzImage-7.2.10-wsl2-x86_64
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+          retention-days: 30
